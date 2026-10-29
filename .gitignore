@@ -1,0 +1,26 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Generated mesh (rebuild with scripts/02-04, ~30 s)
+mesh/
+
+# Reference documents (see README for the NASA link)
+ref/
+
+# SU2 run output (large); keep configs, logs are ignored too
+cases/**/*.dat
+cases/**/*.vtu
+cases/**/*.vtk
+cases/**/*.vtm
+cases/**/*.pvd
+cases/**/*.csv
+cases/**/*.log
+cases/**/.peak_mem
+
+# OS / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
