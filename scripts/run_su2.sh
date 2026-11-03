@@ -23,3 +23,4 @@ echo "wall time          : $((end - start)) s"
 echo "memory before run  : ${base} MB"
 echo "peak memory in use : ${peak} MB  (SU2 used about $((peak - base)) MB)"
 echo "log file           : $LOG"
+exit $status

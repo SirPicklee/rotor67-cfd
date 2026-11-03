@@ -6,10 +6,18 @@ Topology (H-grid, one blade pitch per layer, theta increasing with j):
   surface 2        surface 1                   surface 2 of the next blade (theta + PITCH)
   |-- blade strip --|-------- passage ----------|
 
-  Inside the blade (I_LE <= i <= I_TE, k < K_TIP) the strip cells are blade material and will be
-  removed in the next step. In the tip gap (k >= K_TIP) the strip cells are fluid: the tip
-  leakage flow crosses the blade there. Upstream and downstream the strip and passage lines
-  follow the camber line at the edges and relax to axial, uniformly spaced lines far away.
+Inside the blade (I_LE <= i <= I_TE, k < K_TIP) the strip cells are blade material and are
+removed in step 3. Above the tip they are fluid (tip leakage).
+
+Distribution, as fractions F(i, j) of the pitch measured from the j = 0 line:
+  blade row : wall-clustered strip and passage distributions (first cell DS_PITCH, growth <= RATIO),
+              smoothed along i so that integer changes in the number of growth cells do not
+              create kinks
+  up/down   : F = w * F(edge) + (1 - w) * j / NJ, with w a cosine in the cell index
+              (1 at the edge, 0 at inlet/outlet, zero slope at both ends). Strip and passage are
+              blended together, so cell sizes stay continuous across j = JB.
+  j = 0 line: the strip is centred on the camber line, extended from the edge with the edge slope
+              and relaxing to axial over LB.
 
 Output:
   mesh/b2b.npz               theta(i, j, k)
@@ -34,7 +42,10 @@ JB = 16                # pitchwise cells across the blade strip
 NJ_PASS = 80           # pitchwise cells across the passage
 DS_PITCH = 1.5e-3      # first cell height at the blade surfaces [cm]
 RATIO = 1.20           # max growth ratio away from the blade surfaces
-LB = 1.5               # decay length of the edge influence upstream/downstream [cm]
+LB = 1.5               # camber-line extension: decay length to axial [cm]
+N_SMOOTH = 30          # 1-2-1 smoothing passes of the blade-row distribution along i
+TE_TAPER_U = 0.05      # trailing-edge taper: last 5 % of the chord parameter u
+TE_THICK = 1.0         # trailing-edge taper disabled (1.0 cm > any TE): true NASA geometry
 NJ = JB + NJ_PASS
 
 n_fallback = {"strip": 0, "passage": 0}
@@ -55,13 +66,22 @@ def clustered_n(n, length, ds, ratio, tag):
             d = np.concatenate([grow, np.full(nc, core), grow[::-1]])
             x = np.concatenate([[0.0], np.cumsum(d)])
             return x / x[-1]
-    # growth ratio cannot be respected with n cells: pure two-sided geometric distribution with the
-    # smallest growth ratio q that fills the length (spacing ds * q**min(m, n-1-m))
+    # growth ratio cannot be respected with n cells: two-sided geometric with the smallest ratio
     n_fallback[tag] += 1
     expo = np.minimum(np.arange(n), n - 1 - np.arange(n))
     q = brentq(lambda q: (ds * q ** expo).sum() - length, 1.0 + 1e-12, 20.0)
     x = np.concatenate([[0.0], np.cumsum(ds * q ** expo)])
     return x / x[-1]
+
+
+def smooth_i(f, n_pass):
+    """1-2-1 smoothing along axis 0, end rows included (zero-gradient ends). Columns 0 and -1
+    are 0 and 1 in every row, so the wall and j = JB nodes stay on the blade surfaces."""
+    f = f.copy()
+    for _ in range(n_pass):
+        g = np.concatenate([f[:1], f, f[-1:]])
+        f = 0.25 * g[:-2] + 0.5 * g[1:-1] + 0.25 * g[2:]
+    return f
 
 
 # ----------------------------------------------------------------------------- inputs
@@ -70,14 +90,18 @@ Zm, Rm = M["Z"], M["R"]
 layer_a, layer_b, u_blade = M["layer_a"], M["layer_b"], M["u_blade"]
 I_LE, I_TE, K_TIP = int(M["I_LE"]), int(M["I_TE"]), int(M["K_TIP"])
 NI, NK = Zm.shape
+NB = I_TE - I_LE + 1
 
-fp = Flowpath()
-bl = Blade(fp)
+fp_ = Flowpath()
+bl = Blade(fp_)
 _, _, t1_tip, t2_tip = bl.on_layer(1.0, 0.0, u_blade)
 
 TH = np.zeros((NI, NJ + 1, NK))
-w_far = PITCH * JB / NJ
+uni = np.arange(NJ + 1) / NJ
 z_err = 0.0
+iu = np.arange(0, I_LE)
+idn = np.arange(I_TE + 1, NI)
+LW = 2.0               # blend length of the edge distribution towards uniform [cm]
 
 for k in range(NK):
     z, r = Zm[:, k], Rm[:, k]
@@ -86,75 +110,76 @@ for k in range(NK):
         z_err = max(z_err, np.abs(zb - z[I_LE:I_TE + 1]).max())
     else:
         t1, t2 = t1_tip, t2_tip          # the strip above the tip continues the tip section
-    lo = np.empty(NI)                    # theta at j = 0
-    mid = np.empty(NI)                   # theta at j = JB
-    e = np.ones(NI)                      # 1 near the blade, -> 0 far upstream/downstream
-    lo[I_LE:I_TE + 1], mid[I_LE:I_TE + 1] = t2, t1
-    zb = z[I_LE:I_TE + 1]
+    zb, rb = z[I_LE:I_TE + 1], r[I_LE:I_TE + 1]
+    # trailing-edge taper: thickness reduced quadratically over the last TE_TAPER_U of u,
+    # symmetric about the camber line, to a TE_THICK blunt face (H-grid cannot model the
+    # TE circle; a full-thickness blunt face gives a 90 deg corner expansion that diverges)
+    tcam = 0.5 * (t1 + t2)
+    half = 0.5 * (t1 - t2)
+    s_t = np.clip((u_blade - (1.0 - TE_TAPER_U)) / TE_TAPER_U, 0.0, 1.0)
+    f_end = min(1.0, TE_THICK / (rb[-1] * 2.0 * half[-1]))
+    fac = 1.0 - (1.0 - f_end) * s_t ** 2
+    t1, t2 = tcam + half * fac, tcam - half * fac
+    ws = t1 - t2                         # strip (blade) width [rad]
+    wp = PITCH - ws                      # passage width [rad]
+
+    # blade row: clustered distributions, smoothed along i
+    # wall spacing: DS_PITCH, but never larger than a uniform strip cell (thin tapered TE)
+    ds_b = np.minimum(DS_PITCH, rb * ws / JB)
+    fs = np.array([clustered_n(JB, rb[n] * ws[n], ds_b[n], RATIO, "strip") for n in range(NB)])
+    fq = np.array([clustered_n(NJ_PASS, rb[n] * wp[n], ds_b[n], RATIO, "passage") for n in range(NB)])
+    fs, fq = smooth_i(fs, N_SMOOTH), smooth_i(fq, N_SMOOTH)
+    F = np.empty((NI, NJ + 1))
+    lo = np.empty(NI)
+    F[I_LE:I_TE + 1, :JB + 1] = ws[:, None] * fs / PITCH
+    F[I_LE:I_TE + 1, JB:] = (ws[:, None] + wp[:, None] * fq) / PITCH
+    lo[I_LE:I_TE + 1] = t2
     tc = 0.5 * (t1 + t2)
 
-    # upstream: camber-line extension relaxing to axial, strip width relaxing to uniform spacing
+    # blend weights: Gaussian in the physical distance from the edge, so the tiny edge cells
+    # see (almost) no change and the distribution relaxes smoothly towards inlet/outlet
+    w_up = np.exp(-((z[I_LE] - z[iu]) / LW) ** 2)
+    w_dn = np.exp(-((z[idn] - z[I_TE]) / LW) ** 2)
+
+    # upstream
+    F[iu] = w_up[:, None] * F[I_LE] + (1.0 - w_up)[:, None] * uni
     slope = np.polyfit(zb[:4] - zb[0], tc[:4], 1)[0]
-    iu = np.arange(0, I_LE)
-    ee = np.exp(-(z[I_LE] - z[iu]) / LB)
-    c = tc[0] - slope * LB * (1.0 - ee)
-    w = (t1[0] - t2[0]) * ee + w_far * (1.0 - ee)
-    lo[iu], mid[iu], e[iu] = c - 0.5 * w, c + 0.5 * w, ee
+    c = tc[0] - slope * LB * (1.0 - np.exp(-(z[I_LE] - z[iu]) / LB))
+    lo[iu] = c - 0.5 * PITCH * F[iu, JB]
 
     # downstream
+    F[idn] = w_dn[:, None] * F[I_TE] + (1.0 - w_dn)[:, None] * uni
     slope = np.polyfit(zb[-4:] - zb[-1], tc[-4:], 1)[0]
-    idn = np.arange(I_TE + 1, NI)
-    ee = np.exp(-(z[idn] - z[I_TE]) / LB)
-    c = tc[-1] + slope * LB * (1.0 - ee)
-    w = (t1[-1] - t2[-1]) * ee + w_far * (1.0 - ee)
-    lo[idn], mid[idn], e[idn] = c - 0.5 * w, c + 0.5 * w, ee
+    c = tc[-1] + slope * LB * (1.0 - np.exp(-(z[idn] - z[I_TE]) / LB))
+    lo[idn] = c - 0.5 * PITCH * F[idn, JB]
 
-    for i in range(NI):
-        width_s = mid[i] - lo[i]
-        width_p = lo[i] + PITCH - mid[i]
-        # spacing at j = 0, JB, NJ: DS_PITCH at the blade, relaxing to the uniform spacing far away.
-        # Strip and passage share it, so cell sizes are continuous across j = JB.
-        ds = e[i] * DS_PITCH + (1.0 - e[i]) * r[i] * PITCH / NJ
-        f_s = clustered_n(JB, r[i] * width_s, ds, RATIO, "strip")
-        f_p = clustered_n(NJ_PASS, r[i] * width_p, ds, RATIO, "passage")
-        TH[i, :JB + 1, k] = lo[i] + f_s * width_s
-        TH[i, JB:, k] = mid[i] + f_p * width_p
+    TH[:, :, k] = lo[:, None] + PITCH * F
 
 np.savez(MESH / "b2b.npz", TH=TH, JB=JB, NJ=NJ)
 
 # ----------------------------------------------------------------------------- checks
-RT = Rm[:, None, :] * TH                                   # arc length r*theta [cm]
+RT = Rm[:, None, :] * TH
 dj = np.diff(RT, axis=1)
 print(f"blade-to-blade grid: {NI} x {NJ + 1} x {NK} nodes (strip {JB} + passage {NJ_PASS} cells)")
 print(f"blade z consistency with meridional grid: max |dz| = {z_err:.2e} cm")
 print(f"min pitchwise spacing = {dj.min()*1e4:.1f} um, max = {dj.max():.3f} cm, any <= 0: {(dj <= 0).any()}")
-# cell area in the (z, r*theta) plane: negative = folded cell
 Zb = np.broadcast_to(Zm[:, None, :], RT.shape)
 ax_ = Zb[1:, 1:] - Zb[:-1, :-1]
 ay_ = RT[1:, 1:] - RT[:-1, :-1]
 bx_ = Zb[:-1, 1:] - Zb[1:, :-1]
 by_ = RT[:-1, 1:] - RT[1:, :-1]
 area = 0.5 * (ax_ * by_ - ay_ * bx_)
-print(f"min cell area / max cell area = {area.min():.2e} / {area.max():.2e} cm2, "
-      f"folded cells: {(area <= 0).sum()}")
-ratio_j = dj[:, 1:, :] / dj[:, :-1, :]               # ratio between cell j+1 and cell j
+print(f"min cell area / max cell area = {area.min():.2e} / {area.max():.2e} cm2, folded cells: {(area <= 0).sum()}")
+ratio_j = dj[:, 1:, :] / dj[:, :-1, :]
 ratio_j = np.maximum(ratio_j, 1.0 / ratio_j)
-r_pass = ratio_j[:, JB:, :].max()                    # pairs inside the passage
-fluid = np.ones(ratio_j.shape, bool)                 # strip pairs and pairs across j = JB,
-fluid[I_LE:I_TE + 1, :JB, :K_TIP] = False            # except those touching blade material
-fluid[:, JB:, :] = False
-r_strip = ratio_j[fluid].max()
-print(f"max pitchwise growth ratio: passage = {r_pass:.3f}, fluid strip (gap, up/downstream) = {r_strip:.3f}")
-print(f"geometric fallbacks (growth > {RATIO}): passage = {n_fallback['passage']}, "
-      f"strip = {n_fallback['strip']} of {NI * NK} nodes")
-# where is the largest strip ratio?
-idx = np.unravel_index(np.argmax(np.where(fluid, ratio_j, 0.0)), ratio_j.shape)
-print(f"largest fluid-strip ratio at i = {idx[0]}, j-pair = {idx[1]}, k = {idx[2]} "
-      f"(LE i = {I_LE}, TE i = {I_TE}, tip k = {K_TIP}, JB = {JB})")
+fluid = np.ones(ratio_j.shape, bool)
+fluid[I_LE:I_TE + 1, :JB, :K_TIP] = False
+print(f"max pitchwise growth ratio: passage = {ratio_j[:, JB:, :].max():.3f}, "
+      f"fluid strip and j = JB = {ratio_j[fluid & (np.arange(NJ - 1)[None, :, None] < JB)].max():.3f}")
+print(f"geometric fallbacks: passage = {n_fallback['passage']}, strip = {n_fallback['strip']}")
 n_all = (NI - 1) * NJ * (NK - 1)
 n_blade = (I_TE - I_LE) * JB * K_TIP
-print(f"3D cells: {n_all} total - {n_blade} inside the blade = {n_all - n_blade} "
-      f"(~{(n_all - n_blade)/1e6:.2f} M)")
+print(f"3D cells: {n_all - n_blade} (~{(n_all - n_blade)/1e6:.2f} M)")
 
 # ----------------------------------------------------------------------------- figure
 layers = [(0, "hub (k = 0)"), (K_TIP // 2, f"mid-span (k = {K_TIP // 2})"),
@@ -171,21 +196,18 @@ for col, (k, name) in enumerate(layers):
             ax.plot(np.full(NJ + 1, z[i]), y[i, :], "-", color="0.6", lw=0.3)
         bz = z[I_LE:I_TE + 1]
         style = "k-" if k <= K_TIP else "k--"
-        ax.plot(bz, y[I_LE:I_TE + 1, 0], style, lw=1.2)
-        ax.plot(bz, y[I_LE:I_TE + 1, JB], style, lw=1.2)
-        ax.plot(bz, y[I_LE:I_TE + 1, NJ], style, lw=1.2)
+        for jj in (0, JB, NJ):
+            ax.plot(bz, y[I_LE:I_TE + 1, jj], style, lw=1.2)
         ax.set_aspect("equal")
         ax.set_xlabel("z [cm]")
         if row == 0:
             ax.set_title(name)
             ax.set_xlim(z[I_LE] - 3.0, z[I_TE] + 3.0)
         else:
-            ax.set_title(name + " - leading edge zoom")
-            zc, yc = z[I_LE], y[I_LE, JB]
-            ax.set_xlim(zc - 0.4, zc + 0.4)
-            ax.set_ylim(yc - 0.4, yc + 0.4)
-axes[0, 0].set_ylabel(r"$r\,\theta$ [cm]")
-axes[1, 0].set_ylabel(r"$r\,\theta$ [cm]")
+            ax.set_title(name + " - trailing edge zoom")
+            zc, yc = z[I_TE], y[I_TE, JB]
+            ax.set_xlim(zc - 0.6, zc + 0.6)
+            ax.set_ylim(yc - 0.6, yc + 0.6)
 fig.tight_layout()
 fig.savefig(FIG / "mesh_b2b.png", dpi=130)
 print(f"figure: {FIG / 'mesh_b2b.png'}")

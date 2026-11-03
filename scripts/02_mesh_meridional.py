@@ -28,7 +28,7 @@ NK_GAP = 16                   # cells in the tip gap
 DS_SPAN = 2.0e-3              # first cell height at hub, blade tip and casing [cm]
 SPAN_RATIO = 1.25             # spanwise growth ratio away from the walls
 SPAN_DMAX = 0.30              # largest spanwise cell height [cm] (~2 % span)
-DU_LE, DU_TE = 0.004, 0.006   # first / last chordwise spacing as fraction of the chord parameter
+DU_LE, DU_TE = 0.0008, 0.0008  # first / last chordwise spacing as fraction of the chord parameter
 NJ_ESTIMATE = 72              # pitchwise cells (next step), only for the size estimate here
 
 MESH.mkdir(exist_ok=True)

@@ -24,3 +24,7 @@ cases/**/.peak_mem
 Thumbs.db
 desktop.ini
 .vscode/
+
+# analysis fields (47 MB each) and diagnostic runs
+cases/**/*.npz
+cases/**/diag*.cfg
